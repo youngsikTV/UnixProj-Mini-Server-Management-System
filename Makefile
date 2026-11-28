@@ -7,7 +7,7 @@ LIBS = -pthread
 # 실행 파일별 오브젝트 구성. 모듈이 추가되면 해당 목록에 한 줄씩 늘린다.
 SERVER_OBJS  = build/main.o build/logger.o build/ipc.o
 MONITOR_OBJS = build/monitor.o build/ipc.o build/logger.o
-CTL_OBJS     = build/ctl.o build/ipc.o
+CTL_OBJS     = build/ctl.o build/ipc.o build/ui.o
 BACKUP_OBJS  = build/backup.o build/logger.o
 HDRS         = $(wildcard include/*.h)
 
@@ -28,4 +28,7 @@ build:
 	mkdir -p build
 clean:
 	rm -f build/*.o build/server build/monitor build/backup  build/ctl
-.PHONY: all clean
+# 통합 테스트 실행 (scripts/test.sh 가 make clean, make 를 직접 수행)
+test:
+	bash scripts/test.sh
+.PHONY: all clean test

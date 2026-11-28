@@ -34,7 +34,7 @@ typedef enum {
     LOG_ERROR
 } log_level_t;
 
-/* ---------- ctl -> server 명령 (4~5일차에 사용) ---------- */
+/* ---------- ctl -> server 명령 (FIFO 로 전달) ---------- */
 typedef enum {
     CMD_STATUS = 1,   /* 현재 상태 조회   */
     CMD_BACKUP,       /* 즉시 백업 실행   */
@@ -47,7 +47,13 @@ typedef struct {
     char       arg[256];   /* 선택 인자 (예: 백업할 디렉터리) */
 } cmd_msg_t;
 
-/* ---------- monitor 가 공유 메모리(mmap)에 기록하는 구조체 (3일차에 사용) ---------- */
+/* ---------- monitor 가 공유 메모리(mmap)에 기록하는 구조체 ---------- */
+#define HIST_LEN          60     /* 추이 그래프용 원형 버퍼 칸 수 (2초 간격이면 약 2분) */
+#define MEM_WARN_DEFAULT  90.0   /* 메모리 사용률 경고 임계값 기본값(%) */
+#define WARN_MEM          0x1    /* warn_flags: 메모리 사용률 임계값 초과 중 */
+#define WARN_LOAD         0x2    /* warn_flags: load 임계값 초과 중 */
+#define LOG_TAIL_LINES    10     /* ctl watch 화면에 보여 줄 최근 로그 줄 수 */
+
 typedef struct {
     unsigned long seq;         /* 갱신 횟수 */
     unsigned long samples;     /* 지금까지 수집한 횟수 */
@@ -61,6 +67,17 @@ typedef struct {
     unsigned short procs;      /* sysinfo: 현재 프로세스 수 */
     char          user[32];    /* getpwuid: 실행 사용자 이름 */
     char          host[65];    /* uname: 호스트 이름 (nodename 최대 64자 + NUL) */
+
+    /* ---- 임계값 / 추이 (ctl status, watch 가 막대·추이 그래프로 표시) ---- */
+    int           interval;    /* 수집 주기(초) */
+    int           ncpu;        /* sysconf: 사용 가능한 CPU 수 */
+    double        mem_warn;    /* 메모리 사용률 경고 임계값(%) */
+    double        load_warn;   /* load 경고 임계값 */
+    int           warn_flags;  /* 현재 임계값 초과 상태 (WARN_MEM | WARN_LOAD) */
+    int           hist_pos;    /* 다음에 기록할 칸 번호 (원형 버퍼) */
+    int           hist_len;    /* 채워진 칸 수 (최대 HIST_LEN) */
+    float         mem_hist[HIST_LEN];   /* 메모리 사용률(%) 추이 */
+    float         load_hist[HIST_LEN];  /* load average(1분) 추이 */
 } monitor_data_t;
 
 #define MONITOR_INTERVAL_SEC 2 /* monitor 기본 수집 주기(초) */

@@ -1,3 +1,5 @@
 build/
 *.o
 *.log
+server.pid
+backup_out/

@@ -8,6 +8,7 @@
  *   3) SIGCHLD 로 종료된 worker 를 회수(좀비 방지)하고 로그를 남긴다.
  *   3-1) monitor/backup 이 비정상 종료되면 자동으로 다시 실행한다 (최대 MAX_RESTARTS 회).
  *   4) SIGINT/SIGTERM 을 받으면 모든 worker 를 정리하고 안전하게 종료한다.
+ *   5) SIGUSR1 을 받으면 backup worker 에 즉시 백업을 전달한다 (kill -USR1 <server pid>).
  *
  * 사용한 수업 내용
  *   ch1  명령행 인자 / getopt
@@ -56,6 +57,7 @@ static int      g_log_pipe_wr = -1;          /* logger 로 가는 pipe 쓰기 �
 static int      g_cmd_fd = -1;               /* ctl 명령을 받는 FIFO 의 fd */
 static time_t   g_start_time;                /* supervisor 시작 시각 (status 표시용) */
 static char     g_bindir[PATH_MAX];          /* 이 실행 파일이 있는 디렉터리 (worker 도 여기에 있다) */
+static char     g_logpath[PATH_MAX];         /* 로그 파일 절대 경로 (status 응답으로 ctl 에 알려 줌) */
 
 /* ---------- 시그널 핸들러가 바꾸는 플래그 ----------
  * 핸들러 안에서는 플래그만 세우고, 실제 처리는 main 루프에서 한다.
@@ -63,13 +65,13 @@ static char     g_bindir[PATH_MAX];          /* 이 실행 파일이 있는 디�
 static volatile sig_atomic_t g_got_sigchld = 0;
 static volatile sig_atomic_t g_stop        = 0;
 static volatile sig_atomic_t g_stop_sig    = 0;
-static volatile sig_atomic_t g_reload      = 0;
+static volatile sig_atomic_t g_backup_req      = 0;
 
 static sigset_t g_oldmask;   /* sigsuspend 에서 사용할 "기존 마스크" (모든 시그널 허용 상태) */
 
 static void on_sigchld(int sig) { (void)sig; g_got_sigchld = 1; }
 static void on_stop(int sig)    { g_stop = 1; g_stop_sig = sig; }
-static void on_sigusr1(int sig) { (void)sig; g_reload = 1; }
+static void on_sigusr1(int sig) { (void)sig; g_backup_req = 1; }   /* 즉시 백업 요청 */
 
 /* 시그널 핸들러 등록 도우미 (ch8: sigaction) */
 static int install_handler(int sig, void (*handler)(int), int flags)
@@ -370,10 +372,12 @@ static void build_status(char *buf, size_t size)
            (int)getpid(), (long)(time(NULL) - g_start_time), log_count());
     append(buf, size, "logger     : pid=%d %s\n", (int)g_logger_pid,
            g_logger_pid > 0 ? "(실행 중)" : "(종료됨)");
+    append(buf, size, "logfile    : %s\n", g_logpath);   /* ctl log / watch 가 읽을 파일 */
     for (i = 0; i < g_nworkers; i++) {
         if (g_workers[i].pid > 0)
-            append(buf, size, "%-10s : pid=%d (실행 중, 재시작 %d회)\n",
-                   g_workers[i].name, (int)g_workers[i].pid, g_workers[i].restarts);
+            append(buf, size, "%-10s : pid=%d (실행 중, 재시작 %d회, 가동 %ld초)\n",
+                   g_workers[i].name, (int)g_workers[i].pid, g_workers[i].restarts,
+                   (long)(time(NULL) - g_workers[i].started));
         else
             append(buf, size, "%-10s : 종료됨\n", g_workers[i].name);
     }
@@ -383,7 +387,7 @@ static void build_status(char *buf, size_t size)
 /* ctl 명령 하나를 처리하고 응답을 돌려보낸다 */
 static void handle_command(const cmd_msg_t *m)
 {
-    char reply[1024];
+    char reply[2048];
     worker_t *w;
 
     reply[0] = '\0';
@@ -455,6 +459,14 @@ int main(int argc, char *argv[])
 
     init_bindir(argv[0]);
 
+    /* 로그 경로를 절대 경로로 저장: ctl 이 다른 디렉터리에서 실행돼도 로그를 찾을 수 있게 한다 */
+    if (logpath[0] == '/' || getcwd(g_logpath, sizeof(g_logpath)) == NULL) {
+        snprintf(g_logpath, sizeof(g_logpath), "%s", logpath);
+    } else {
+        size_t len = strlen(g_logpath);
+        snprintf(g_logpath + len, sizeof(g_logpath) - len, "/%s", logpath);
+    }
+
     /* 1) logger 먼저 시작 (자식이 기본 시그널 설정을 갖도록 setup_signals 보다 먼저 호출) */
     if (start_logger(logpath) < 0)
         return 1;
@@ -514,9 +526,16 @@ int main(int argc, char *argv[])
             g_got_sigchld = 0;
             reap_children();
         }
-        if (g_reload) {
-            g_reload = 0;
-            log_write(LOG_INFO, "SIGUSR1 수신: 설정 재로드 (TODO)");
+        if (g_backup_req) {
+            g_backup_req = 0;
+            /* kill -USR1 <server pid> 로도 ctl backup 과 같은 즉시 백업을 요청할 수 있다 */
+            worker_t *bw = find_worker("backup");
+            if (bw != NULL) {
+                kill(bw->pid, SIGUSR1);                   /* ch8: backup worker 에 전달 */
+                log_write(LOG_INFO, "SIGUSR1 수신: backup worker(pid=%d)에 즉시 백업 전달", (int)bw->pid);
+            } else {
+                log_write(LOG_WARN, "SIGUSR1 수신: backup worker 가 실행 중이 아님");
+            }
         }
         /* 시그널 또는 ctl 명령(FIFO 입력)이 올 때까지 대기.
          * pselect 는 sigsuspend 처럼 "마스크 해제 + 대기"를 원자적으로 수행하므로

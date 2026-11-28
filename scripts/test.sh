@@ -92,6 +92,14 @@ check "ctl backup 요청 접수"                "$BIN/ctl" backup
 check "변경된 파일만 갱신됨"                wait_for 6 sh -c "grep -q 'version 2' backup_out/a.txt && test -f backup_out/c.txt"
 check "원본과 백업본이 동일(diff -r)"       diff -r data backup_out
 check "백업 완료 로그 존재"                 grep -q "백업 완료" "$WORK/server.log"
+check "SIGUSR1 으로 즉시 백업 전달"         sh -c "kill -USR1 $SERVER_PID && sleep 1 && grep -q 'SIGUSR1 수신' '$WORK/server.log'"
+
+# ---- 4-1. ctl 화면 ----------------------------------------------------------
+echo "[4-1] ctl 화면 (status / log / watch)"
+check "status 에 막대·추이 그래프 표시"     sh -c "'$BIN/ctl' status | grep -q '메모리 추이'"
+check "ctl log 가 로그 파일을 찾아 출력"    sh -c "'$BIN/ctl' log -n 200 | grep -q 'supervisor 시작'"
+check "ctl watch 에 프로세스 표 표시"       sh -c "'$BIN/ctl' watch -n 1 | grep -q 'RESTART'"
+check "ctl watch 에 최근 로그 10줄 표시"    sh -c "'$BIN/ctl' watch -n 2 -d 0.5 | grep -q '최근 로그'"
 
 # ---- 5. 자동 재시작 --------------------------------------------------------
 echo "[5] worker 자동 재시작"
@@ -99,6 +107,7 @@ OLD_PID=$(worker_pid monitor)
 kill -9 "$OLD_PID" 2>/dev/null
 check "monitor 를 강제 종료하면 다시 실행됨" wait_for 6 sh -c "p=\$('$BIN/ctl' status | sed -n 's/^monitor *: pid=\\([0-9]*\\).*/\\1/p'); test -n \"\$p\" -a \"\$p\" != '$OLD_PID'"
 check "재시작 로그 존재"                    grep -q "monitor 재시작" "$WORK/server.log"
+check "ctl log -w 는 WARN/ERROR 만 출력"    sh -c "'$BIN/ctl' log -w -n 50 | grep -q 'WARN' && ! '$BIN/ctl' log -w -n 50 | grep -q 'INFO'"
 check "좀비 프로세스 없음"                  test -z "$(ps -o stat= --ppid "$SERVER_PID" | grep Z)"
 
 # ---- 6. 종료 ---------------------------------------------------------------
@@ -109,6 +118,11 @@ check "명령 FIFO 삭제됨"                    test ! -e /tmp/unixproj_cmd.fif
 check "공유 메모리 파일 삭제됨"             test ! -e /tmp/unixproj_monitor.shm
 check "남은 worker 프로세스 없음"           test -z "$(pgrep -x monitor; pgrep -x backup)"
 check "서버 없을 때 ctl 은 오류 코드 반환"  sh -c "! '$BIN/ctl' status"
+
+# ---- 7. monitor 임계값 경고 ------------------------------------------------
+echo "[7] monitor 임계값 경고 (단독 실행)"
+check "임계값을 넘으면 WARN 로그"           sh -c "timeout 3 '$BIN/monitor' -i 1 -m 1 -L 0.01 2>&1 | grep -q 'WARN.*임계값'"
+check "monitor 종료 후 공유 메모리 삭제"    test ! -e /tmp/unixproj_monitor.shm
 
 # ---- 요약 ------------------------------------------------------------------
 echo
