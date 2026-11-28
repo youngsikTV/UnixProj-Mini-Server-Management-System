@@ -11,6 +11,12 @@
  *   ch6  sysinfo(메모리/load/프로세스 수), times + sysconf(CPU 시간), getenv
  *   ch8  sigaction / setitimer(SIGALRM 주기 실행) / sigsuspend
  *   ch9  mmap 공유 메모리 (ipc.c 의 shm_* 함수)
+ *
+ * 임계값 경고
+ *   메모리 사용률(-m, 기본 90%) 또는 load(-L, 기본 CPU 수)를 넘으면 WARN 로그를 남긴다.
+ *   초과가 계속되는 동안 매번 쓰지 않고 "정상 -> 초과", "초과 -> 정상" 으로 바뀔 때만 기록한다.
+ * 추이 기록
+ *   최근 HIST_LEN 회의 값을 공유 메모리의 원형 버퍼에 남겨 ctl 이 추이 그래프를 그린다.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -38,6 +44,10 @@ static volatile sig_atomic_t g_stop = 0;   /* SIGTERM/SIGINT: 종료 */
 static void on_alarm(int sig) { (void)sig; g_tick = 1; }
 static void on_stop(int sig)  { (void)sig; g_stop = 1; }
 
+/* 임계값 (getopt 로 설정) */
+static double g_mem_warn  = MEM_WARN_DEFAULT;  /* -m: 메모리 사용률 경고 임계값(%) */
+static double g_load_warn = 0.0;               /* -L: load 경고 임계값 (0 이면 CPU 수) */
+
 /* sigaction 등록 도우미 */
 static int install_handler(int sig, void (*handler)(int))
 {
@@ -60,6 +70,9 @@ static void collect(monitor_data_t *d)
     struct utsname un;
     struct passwd *pw;
     long hz = sysconf(_SC_CLK_TCK);                     /* ch5: 초당 clock tick 수 */
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);           /* ch5: 사용 가능한 CPU 수 */
+    double mem_pct, load_warn;
+    int flags, old;
 
     memset(&si, 0, sizeof(si));
     if (sysinfo(&si) < 0)                                /* ch6: 메모리/uptime/load/프로세스 수 */
@@ -78,14 +91,55 @@ static void collect(monitor_data_t *d)
     d->load1    = (double)si.loads[0] / 65536.0;         /* sysinfo 의 load 는 16비트 고정소수점 */
     d->uptime   = (unsigned long)si.uptime;
     d->totalram = (unsigned long)si.totalram * si.mem_unit;
-    d->freeram  = (unsigned long)si.freeram  * si.mem_unit;
+    /* 버퍼로 쓰는 메모리는 바로 돌려받을 수 있으므로 남은 메모리에 포함한다 */
+    d->freeram  = (unsigned long)(si.freeram + si.bufferram) * si.mem_unit;
     d->procs    = si.procs;
+
+    if (ncpu < 1)
+        ncpu = 1;
+    load_warn    = g_load_warn > 0 ? g_load_warn : (double)ncpu;
+    d->ncpu      = (int)ncpu;
+    d->mem_warn  = g_mem_warn;
+    d->load_warn = load_warn;
+    mem_pct = d->totalram > 0
+              ? (double)(d->totalram - d->freeram) * 100.0 / (double)d->totalram : 0.0;
+
+    /* 추이 기록: 원형 버퍼라서 가득 차면 가장 오래된 칸을 덮어쓴다 */
+    d->mem_hist[d->hist_pos]  = (float)mem_pct;
+    d->load_hist[d->hist_pos] = (float)d->load1;
+    d->hist_pos = (d->hist_pos + 1) % HIST_LEN;
+    if (d->hist_len < HIST_LEN)
+        d->hist_len++;
+
+    flags = 0;
+    if (mem_pct >= g_mem_warn)
+        flags |= WARN_MEM;
+    if (d->load1 >= load_warn)
+        flags |= WARN_LOAD;
+    old = d->warn_flags;
+    d->warn_flags = flags;
     shm_update_end(d);
+
+    /* 임계값 검사: 상태가 바뀔 때만 로그를 남긴다 (초과가 계속될 때 2초마다 쓰면 로그가 넘친다).
+     * log_write 는 pipe write 라서 seqlock 구간 밖에서 호출한다. */
+    if ((flags & WARN_MEM) && !(old & WARN_MEM))
+        log_write(LOG_WARN, "메모리 사용률 %.1f%% 가 임계값 %.0f%% 를 넘었습니다", mem_pct, g_mem_warn);
+    else if (!(flags & WARN_MEM) && (old & WARN_MEM))
+        log_write(LOG_INFO, "메모리 사용률 정상 복귀 (%.1f%%)", mem_pct);
+    if ((flags & WARN_LOAD) && !(old & WARN_LOAD))
+        log_write(LOG_WARN, "load %.2f 가 임계값 %.2f 를 넘었습니다", d->load1, load_warn);
+    else if (!(flags & WARN_LOAD) && (old & WARN_LOAD))
+        log_write(LOG_INFO, "load 정상 복귀 (%.2f)", d->load1);
 }
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "사용법: %s [-i 주기(초)] [-h]\n", prog);
+    fprintf(stderr,
+            "사용법: %s [-i 주기(초)] [-m 메모리%%] [-L load] [-h]\\n"
+            "  -i 초      수집 주기 (기본: %d)\\n"
+            "  -m 퍼센트  메모리 사용률 경고 임계값 (기본: %.0f)\\n"
+            "  -L 값      load 경고 임계값 (기본: CPU 수)\\n",
+            prog, MONITOR_INTERVAL_SEC, MEM_WARN_DEFAULT);
 }
 
 int main(int argc, char *argv[])
@@ -98,15 +152,21 @@ int main(int argc, char *argv[])
     struct itimerval it;
     sigset_t block, oldmask;
 
-    while ((opt = getopt(argc, argv, "i:h")) != -1) {
+    while ((opt = getopt(argc, argv, "i:m:L:h")) != -1) {
         switch (opt) {
         case 'i': interval = atoi(optarg); break;
+        case 'm': g_mem_warn = atof(optarg); break;
+        case 'L': g_load_warn = atof(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
     }
     if (interval <= 0) {
         fprintf(stderr, "주기는 1 이상의 정수여야 합니다.\n");
+        return 1;
+    }
+    if (g_mem_warn <= 0 || g_mem_warn > 100 || g_load_warn < 0) {
+        fprintf(stderr, "임계값이 올바르지 않습니다. (-m 1~100, -L 0 이상)\n");
         return 1;
     }
 
@@ -150,7 +210,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    log_write(LOG_INFO, "monitor 시작 (주기 %d초, shm=%s)", interval, SHM_FILE_PATH);
+    shm_update_begin(d);
+    d->interval = interval;            /* ctl 이 "N초 간격" 으로 표시 */
+    shm_update_end(d);
+    log_write(LOG_INFO, "monitor 시작 (주기 %d초, 임계값 메모리 %.0f%% / load %s, shm=%s)",
+              interval, g_mem_warn, g_load_warn > 0 ? "지정" : "CPU 수", SHM_FILE_PATH);
     collect(d);                        /* 첫 값은 바로 기록 */
     n++;
 

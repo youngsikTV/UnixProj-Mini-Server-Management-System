@@ -1,8 +1,9 @@
 /*
  * ipc.h - 프로세스 간 통신(IPC) 모듈 인터페이스
  *
- * 현재 제공: mmap 공유 메모리 (monitor -> ctl)
- * 5일차에 FIFO 명령 송수신 함수(ctl <-> server)를 이 모듈에 추가한다.
+ * 제공 기능
+ *   - mmap 공유 메모리 (monitor -> ctl), seqlock 으로 일관된 읽기
+ *   - FIFO 명령 채널   (ctl <-> server)
  */
 #ifndef IPC_H
 #define IPC_H

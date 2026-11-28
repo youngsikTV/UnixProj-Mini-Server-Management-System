@@ -1,10 +1,11 @@
 /*
- * ipc.c - IPC 모듈 (mmap 공유 메모리)
+ * ipc.c - IPC 모듈 (mmap 공유 메모리 + FIFO 명령 채널)
  *
  * 사용한 수업 내용
  *   ch4  open / ftruncate / close
  *   ch3  unlink (공유 파일 삭제)
  *   ch9  mmap / munmap, MAP_SHARED
+ *   ch10 mkfifo / open(O_NONBLOCK) / read / write (ctl 명령과 응답)
  *
  * 동작 원리
  *   파일을 MAP_SHARED 로 mmap 하면 같은 파일을 매핑한 모든 프로세스가

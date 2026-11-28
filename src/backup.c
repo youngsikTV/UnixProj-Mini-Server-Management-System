@@ -4,7 +4,7 @@
  * 역할
  *   원본 디렉터리를 재귀적으로 순회하며 "변경된 파일만" 백업 디렉터리로 복사한다.
  *   - 주기적 실행: setitimer(SIGALRM)
- *   - 즉시 실행  : SIGUSR1 (5일차에 ctl 이 supervisor 를 통해 전달할 예정)
+ *   - 즉시 실행  : SIGUSR1 (ctl backup 요청을 supervisor 가 kill 로 전달)
  *   - 종료       : SIGTERM / SIGINT (진행 중이던 파일까지만 처리하고 정리)
  *
  * 복사는 스레드 풀이 병렬로 처리한다.
